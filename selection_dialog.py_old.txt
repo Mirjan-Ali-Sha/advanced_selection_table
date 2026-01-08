@@ -1,0 +1,2160 @@
+# -*- coding: utf-8 -*-
+"""
+Advanced Selection Table Dialog - Advanced Attribute Table
+Implements two-tier selection: Cyan (original selection) and Yellow (highlighted subset)
+Supports docking like the original QGIS attribute table.
+Map canvas shows: Cyan = original selection, Yellow = highlighted subset
+"""
+import os
+from qgis.PyQt.QtCore import Qt, pyqtSignal, QEvent
+from qgis.PyQt.QtGui import QIcon, QColor, QBrush, QPainter, QPalette
+from qgis.PyQt.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QToolBar, QAction, QMessageBox, 
+    QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QApplication, QStyledItemDelegate, QStyle, QWidget, QDockWidget,
+    QPushButton, QSizePolicy, QComboBox, QListWidget, QListWidgetItem,
+    QGroupBox, QLineEdit, QDialogButtonBox, QSplitter, QFormLayout
+)
+from qgis.core import QgsFeatureRequest, QgsVectorLayer, QgsFeature, QgsApplication, QgsGeometry, QgsWkbTypes
+from qgis.gui import QgsRubberBand
+
+
+class HighlightDelegate(QStyledItemDelegate):
+    """Custom delegate that overrides Qt selection highlighting with our colors"""
+    
+    def __init__(self, dialog, parent=None):
+        super().__init__(parent)
+        self.dialog = dialog
+    
+    def paint(self, painter, option, index):
+        """Override paint to use our custom highlight colors"""
+        row = index.row()
+        fid = self.dialog.get_fid_for_row(row)
+        
+        # Create a modified option that doesn't show Qt selection
+        modified_option = QStyledItemDelegate.initStyleOption(self, option, index)
+        
+        painter.save()
+        
+        # Draw background based on our highlight state
+        if fid is not None and fid in self.dialog.highlighted_features:
+            # Yellow for highlighted (selected in our system)
+            painter.fillRect(option.rect, QColor(255, 255, 0))  # Bright yellow
+        elif fid is not None:
+            # Cyan for original selection
+            painter.fillRect(option.rect, QColor(0, 255, 255))  # Cyan
+        
+        painter.restore()
+        
+        # Draw the text and other content (without Qt's default selection highlight)
+        # Remove the Selected state to prevent blue highlighting
+        option.state = option.state & ~QStyle.State_Selected
+        super().paint(painter, option, index)
+
+
+class SelectionFilterDialog(QDialog):
+    """
+    Advanced expression builder with proper value extraction, 
+    logical operators, condition management, and expanded expression editor.
+    """
+    
+    def __init__(self, layer, selected_fids, parent=None):
+        super().__init__(parent)
+        self.layer = layer
+        self.selected_fids = selected_fids
+        self.conditions = []  # List of (logic, expression) tuples
+        self.value_cache = {}
+        
+        self.setWindowTitle('Advanced Filter Builder')
+        self.setMinimumSize(800, 650)
+        self.setup_ui()
+        self.cache_all_field_values()
+        self.load_fields()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        layout.setSpacing(6)
+        self.setLayout(layout)
+        
+        # Header
+        header = QLabel(
+            f'<b style="color:#006064;">🔍 Filter within {len(self.selected_fids)} selected features</b>'
+        )
+        header.setStyleSheet("padding: 8px; background: linear-gradient(to right, #e0f7fa, #b2ebf2); border-radius: 4px;")
+        layout.addWidget(header)
+        
+        # Main content - horizontal splitter
+        main_splitter = QSplitter(Qt.Horizontal)
+        
+        # === LEFT PANEL: Field + Operator ===
+        left_widget = QWidget()
+        left_layout = QVBoxLayout()
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_widget.setLayout(left_layout)
+        
+        # Field group
+        field_group = QGroupBox("📋 Field")
+        field_layout = QVBoxLayout()
+        self.field_combo = QComboBox()
+        self.field_combo.currentIndexChanged.connect(self.on_field_changed)
+        field_layout.addWidget(self.field_combo)
+        self.field_type_label = QLabel()
+        self.field_type_label.setStyleSheet("color: #666; font-size: 10px;")
+        field_layout.addWidget(self.field_type_label)
+        field_group.setLayout(field_layout)
+        left_layout.addWidget(field_group)
+        
+        # Operator group
+        op_group = QGroupBox("⚙️ Operator")
+        op_layout = QVBoxLayout()
+        self.op_combo = QComboBox()
+        self.op_combo.addItems([
+            '= (equals)', '!= (not equals)', 
+            '> (greater)', '< (less)', '>= (greater/equal)', '<= (less/equal)',
+            'LIKE (contains)', 'NOT LIKE', 
+            'IN (any of)', 'NOT IN',
+            'IS NULL', 'IS NOT NULL', 'BETWEEN'
+        ])
+        self.op_combo.currentIndexChanged.connect(self.on_operator_changed)
+        op_layout.addWidget(self.op_combo)
+        op_group.setLayout(op_layout)
+        left_layout.addWidget(op_group)
+        
+        # Logical Operators group
+        logic_group = QGroupBox("🔗 Logical Operators")
+        logic_layout = QVBoxLayout()
+        
+        # Operator buttons
+        and_btn = QPushButton("AND")
+        and_btn.setToolTip("Insert AND operator")
+        and_btn.clicked.connect(lambda: self.insert_logic_operator("AND"))
+        or_btn = QPushButton("OR")
+        or_btn.setToolTip("Insert OR operator")
+        or_btn.clicked.connect(lambda: self.insert_logic_operator("OR"))
+        not_btn = QPushButton("NOT")
+        not_btn.setToolTip("Insert NOT operator")
+        not_btn.clicked.connect(lambda: self.insert_logic_operator("NOT"))
+        
+        logic_row1 = QHBoxLayout()
+        logic_row1.addWidget(and_btn)
+        logic_row1.addWidget(or_btn)
+        logic_row1.addWidget(not_btn)
+        logic_layout.addLayout(logic_row1)
+        
+        # Parentheses
+        open_paren = QPushButton("(")
+        open_paren.clicked.connect(lambda: self.insert_logic_operator("("))
+        close_paren = QPushButton(")")
+        close_paren.clicked.connect(lambda: self.insert_logic_operator(")"))
+        
+        logic_row2 = QHBoxLayout()
+        logic_row2.addWidget(open_paren)
+        logic_row2.addWidget(close_paren)
+        logic_layout.addLayout(logic_row2)
+        
+        logic_group.setLayout(logic_layout)
+        left_layout.addWidget(logic_group)
+        
+        left_layout.addStretch()
+        main_splitter.addWidget(left_widget)
+        
+        # === RIGHT PANEL: Values ===
+        right_widget = QWidget()
+        right_layout = QVBoxLayout()
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_widget.setLayout(right_layout)
+        
+        value_group = QGroupBox("📊 Values (from selection only)")
+        value_layout = QVBoxLayout()
+        
+        # Search
+        search_layout = QHBoxLayout()
+        search_layout.addWidget(QLabel("🔎"))
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("Search values...")
+        self.search_box.textChanged.connect(self.filter_values)
+        search_layout.addWidget(self.search_box)
+        value_layout.addLayout(search_layout)
+        
+        # Value list
+        self.value_list = QListWidget()
+        self.value_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.value_list.itemDoubleClicked.connect(lambda: self.add_condition_with_logic('AND'))
+        value_layout.addWidget(self.value_list)
+        
+        # Stats
+        self.stats_label = QLabel()
+        self.stats_label.setStyleSheet("color: #666; font-size: 10px;")
+        value_layout.addWidget(self.stats_label)
+        
+        # Manual input
+        self.manual_value = QLineEdit()
+        self.manual_value.setPlaceholderText("Or enter custom value...")
+        value_layout.addWidget(self.manual_value)
+        
+        value_group.setLayout(value_layout)
+        right_layout.addWidget(value_group)
+        main_splitter.addWidget(right_widget)
+        
+        main_splitter.setSizes([280, 450])
+        layout.addWidget(main_splitter)
+        
+        # === CONDITION BUILDER BUTTONS ===
+        btn_layout = QHBoxLayout()
+        
+        add_and_btn = QPushButton("➕ Add with AND")
+        add_and_btn.setStyleSheet("background-color: #c8e6c9; font-weight: bold; padding: 6px;")
+        add_and_btn.clicked.connect(lambda: self.add_condition_with_logic('AND'))
+        btn_layout.addWidget(add_and_btn)
+        
+        add_or_btn = QPushButton("➕ Add with OR")
+        add_or_btn.setStyleSheet("background-color: #ffe0b2; font-weight: bold; padding: 6px;")
+        add_or_btn.clicked.connect(lambda: self.add_condition_with_logic('OR'))
+        btn_layout.addWidget(add_or_btn)
+        
+        add_simple_btn = QPushButton("➕ Add (no logic)")
+        add_simple_btn.clicked.connect(lambda: self.add_condition_with_logic(None))
+        btn_layout.addWidget(add_simple_btn)
+        
+        layout.addLayout(btn_layout)
+        
+        # === CONDITIONS LIST ===
+        cond_group = QGroupBox("📝 Conditions (click to select, then remove)")
+        cond_layout = QVBoxLayout()
+        
+        self.conditions_list = QListWidget()
+        self.conditions_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.conditions_list.setMinimumHeight(80)
+        self.conditions_list.setStyleSheet("font-family: monospace; font-size: 11px;")
+        cond_layout.addWidget(self.conditions_list)
+        
+        # Remove selected conditions button
+        remove_layout = QHBoxLayout()
+        remove_btn = QPushButton("🗑️ Remove Selected")
+        remove_btn.clicked.connect(self.remove_selected_conditions)
+        remove_layout.addWidget(remove_btn)
+        
+        clear_btn = QPushButton("🗑️ Clear All")
+        clear_btn.clicked.connect(self.clear_conditions)
+        remove_layout.addWidget(clear_btn)
+        
+        remove_layout.addStretch()
+        cond_layout.addLayout(remove_layout)
+        
+        cond_group.setLayout(cond_layout)
+        layout.addWidget(cond_group)
+        
+        # === EXPRESSION EDITOR (EXPANDED) ===
+        expr_group = QGroupBox("📄 Expression (editable - you can type directly)")
+        expr_layout = QVBoxLayout()
+        
+        # Use QTextEdit for multi-line
+        from qgis.PyQt.QtWidgets import QTextEdit
+        self.expr_edit = QTextEdit()
+        self.expr_edit.setMinimumHeight(80)
+        self.expr_edit.setStyleSheet(
+            "font-family: 'Consolas', 'Monaco', monospace; font-size: 12px; "
+            "padding: 8px; background-color: #fffde7; border: 1px solid #ddd;"
+        )
+        self.expr_edit.setPlaceholderText("Expression will appear here...\nYou can also edit directly.")
+        expr_layout.addWidget(self.expr_edit)
+        
+        # Action buttons
+        action_layout = QHBoxLayout()
+        
+        test_btn = QPushButton("🧪 Test Expression")
+        test_btn.clicked.connect(self.test_expression)
+        action_layout.addWidget(test_btn)
+        
+        copy_btn = QPushButton("📋 Copy")
+        copy_btn.clicked.connect(self.copy_expression)
+        action_layout.addWidget(copy_btn)
+        
+        build_btn = QPushButton("🔨 Rebuild from Conditions")
+        build_btn.clicked.connect(self.rebuild_expression)
+        action_layout.addWidget(build_btn)
+        
+        action_layout.addStretch()
+        
+        self.match_label = QLabel()
+        self.match_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        action_layout.addWidget(self.match_label)
+        
+        expr_layout.addLayout(action_layout)
+        expr_group.setLayout(expr_layout)
+        layout.addWidget(expr_group)
+        
+        # Dialog buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        button_box.button(QDialogButtonBox.Ok).setText("Apply Filter")
+        button_box.button(QDialogButtonBox.Ok).setStyleSheet(
+            "background-color: #4CAF50; color: white; font-weight: bold; padding: 8px 20px;"
+        )
+        layout.addWidget(button_box)
+    
+    def cache_all_field_values(self):
+        """Cache all field values from selected features"""
+        request = QgsFeatureRequest().setFilterFids(list(self.selected_fids))
+        
+        for field in self.layer.fields():
+            self.value_cache[field.name()] = {}
+        
+        for feature in self.layer.getFeatures(request):
+            for field in self.layer.fields():
+                value = feature.attribute(field.name())
+                if value is not None:
+                    str_val = str(value)
+                    self.value_cache[field.name()][str_val] = \
+                        self.value_cache[field.name()].get(str_val, 0) + 1
+    
+    def load_fields(self):
+        """Load field names"""
+        self.field_combo.clear()
+        for field in self.layer.fields():
+            self.field_combo.addItem(field.name(), field.name())
+        if self.field_combo.count() > 0:
+            self.on_field_changed(0)
+    
+    def on_field_changed(self, index):
+        """Handle field selection change"""
+        if index < 0:
+            return
+        field_name = self.field_combo.currentData() or self.field_combo.currentText()
+        
+        for field in self.layer.fields():
+            if field.name() == field_name:
+                self.field_type_label.setText(f"Type: {field.typeName()}")
+                break
+        
+        self.populate_value_list(field_name)
+    
+    def populate_value_list(self, field_name, filter_text=''):
+        """Populate value list - store clean values"""
+        self.value_list.clear()
+        
+        if field_name not in self.value_cache:
+            return
+        
+        values = self.value_cache[field_name]
+        total = sum(values.values())
+        shown = 0
+        
+        for value in sorted(values.keys()):
+            if filter_text and filter_text.lower() not in value.lower():
+                continue
+            count = values[value]
+            # Display with count, store clean value
+            item = QListWidgetItem(f"{value}  ({count})")
+            item.setData(Qt.UserRole, value)  # IMPORTANT: Store CLEAN value
+            self.value_list.addItem(item)
+            shown += 1
+        
+        self.stats_label.setText(f"{shown} of {len(values)} values ({total} features)")
+    
+    def filter_values(self, text):
+        """Filter values by search text"""
+        field_name = self.field_combo.currentData() or self.field_combo.currentText()
+        self.populate_value_list(field_name, text)
+    
+    def on_operator_changed(self, index):
+        """Update UI for operator"""
+        op_text = self.op_combo.currentText()
+        if 'NULL' in op_text:
+            self.value_list.setEnabled(False)
+            self.manual_value.setEnabled(False)
+        else:
+            self.value_list.setEnabled(True)
+            self.manual_value.setEnabled(True)
+    
+    def get_operator_symbol(self):
+        """Extract operator from combo text"""
+        text = self.op_combo.currentText()
+        if 'IS NOT NULL' in text: return 'IS NOT NULL'
+        if 'IS NULL' in text: return 'IS NULL'
+        if 'NOT LIKE' in text: return 'NOT LIKE'
+        if 'LIKE' in text: return 'LIKE'
+        if 'NOT IN' in text: return 'NOT IN'
+        if 'BETWEEN' in text: return 'BETWEEN'
+        if 'IN' in text: return 'IN'
+        if '!=' in text: return '!='
+        if '>=' in text: return '>='
+        if '<=' in text: return '<='
+        if '>' in text: return '>'
+        if '<' in text: return '<'
+        if '=' in text: return '='
+        return '='
+    
+    def build_single_condition(self):
+        """Build ONE condition from current UI state"""
+        field = self.field_combo.currentData() or self.field_combo.currentText()
+        op = self.get_operator_symbol()
+        
+        # NULL operators don't need value
+        if op in ('IS NULL', 'IS NOT NULL'):
+            return f'"{field}" {op}'
+        
+        # Get values - IMPORTANT: use UserRole data, not text
+        selected_items = self.value_list.selectedItems()
+        manual = self.manual_value.text().strip()
+        
+        if manual:
+            values = [manual]
+        elif selected_items:
+            values = [item.data(Qt.UserRole) for item in selected_items]
+        else:
+            return None
+        
+        # BETWEEN
+        if op == 'BETWEEN':
+            if len(values) >= 2:
+                return f'"{field}" BETWEEN {values[0]} AND {values[1]}'
+            elif ' AND ' in values[0].upper():
+                return f'"{field}" BETWEEN {values[0]}'
+            return None
+        
+        # IN / NOT IN or multiple values
+        if op in ('IN', 'NOT IN') or len(values) > 1:
+            quoted = []
+            for v in values:
+                try:
+                    float(v)
+                    quoted.append(str(v))
+                except ValueError:
+                    quoted.append(f"'{v}'")
+            actual_op = 'NOT IN' if op == 'NOT IN' else 'IN'
+            return f'"{field}" {actual_op} ({", ".join(quoted)})'
+        
+        # Single value
+        value = values[0]
+        try:
+            float(value)
+            is_numeric = True
+        except ValueError:
+            is_numeric = False
+        
+        if op in ('LIKE', 'NOT LIKE'):
+            return f'"{field}" {op} \'%{value}%\''
+        elif is_numeric:
+            return f'"{field}" {op} {value}'
+        else:
+            return f'"{field}" {op} \'{value}\''
+    
+    def add_condition_with_logic(self, logic):
+        """Add condition with specified logic (AND/OR/None)"""
+        condition = self.build_single_condition()
+        if not condition:
+            return
+        
+        self.conditions.append((logic, condition))
+        self.update_conditions_display()
+        self.rebuild_expression()
+    
+    def insert_logic_operator(self, op):
+        """Insert logic operator at cursor in expression editor"""
+        cursor = self.expr_edit.textCursor()
+        cursor.insertText(f" {op} ")
+    
+    def remove_selected_conditions(self):
+        """Remove selected conditions from list"""
+        selected_rows = sorted([self.conditions_list.row(item) for item in self.conditions_list.selectedItems()], reverse=True)
+        for row in selected_rows:
+            if row < len(self.conditions):
+                del self.conditions[row]
+        self.update_conditions_display()
+        self.rebuild_expression()
+    
+    def clear_conditions(self):
+        """Clear all conditions"""
+        self.conditions.clear()
+        self.conditions_list.clear()
+        self.expr_edit.clear()
+        self.match_label.clear()
+    
+    def update_conditions_display(self):
+        """Update conditions list widget"""
+        self.conditions_list.clear()
+        for i, (logic, expr) in enumerate(self.conditions):
+            if logic and i > 0:
+                self.conditions_list.addItem(f"{logic} {expr}")
+            else:
+                self.conditions_list.addItem(expr)
+    
+    def rebuild_expression(self):
+        """Rebuild expression from conditions list"""
+        if not self.conditions:
+            self.expr_edit.clear()
+            return
+        
+        parts = []
+        for i, (logic, expr) in enumerate(self.conditions):
+            if logic and i > 0:
+                parts.append(logic)
+            parts.append(expr)
+        
+        self.expr_edit.setPlainText(' '.join(parts))
+    
+    def test_expression(self):
+        """Test expression and show match count - manually evaluate on each feature"""
+        expr_text = self.expr_edit.toPlainText().strip()
+        if not expr_text:
+            self.match_label.setText("No expression")
+            self.match_label.setStyleSheet("color: #666;")
+            return
+        
+        try:
+            from qgis.core import QgsExpression, QgsExpressionContext, QgsExpressionContextUtils
+            
+            # Create and prepare expression
+            expr = QgsExpression(expr_text)
+            if expr.hasParserError():
+                self.match_label.setText(f"❌ Parse error: {expr.parserErrorString()[:30]}")
+                self.match_label.setStyleSheet("color: #c62828;")
+                return
+            
+            # Create context
+            context = QgsExpressionContext()
+            context.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(self.layer))
+            
+            # Get features from selection and evaluate manually
+            request = QgsFeatureRequest().setFilterFids(list(self.selected_fids))
+            count = 0
+            for feature in self.layer.getFeatures(request):
+                context.setFeature(feature)
+                result = expr.evaluate(context)
+                if result:
+                    count += 1
+            
+            self.match_label.setText(f"✅ {count} matches out of {len(self.selected_fids)}")
+            self.match_label.setStyleSheet("color: #2e7d32; font-weight: bold;")
+        except Exception as e:
+            self.match_label.setText(f"❌ Error: {str(e)[:30]}")
+            self.match_label.setStyleSheet("color: #c62828;")
+    
+    def copy_expression(self):
+        """Copy expression to clipboard"""
+        QApplication.clipboard().setText(self.expr_edit.toPlainText())
+    
+    def get_expression(self):
+        """Return the expression"""
+        return self.expr_edit.toPlainText().strip()
+
+
+class FieldCalculatorDialog(QDialog):
+    """
+    QGIS-style Field Calculator for targeted feature updates.
+    Matches the layout/functionality of QGIS default Field Calculator
+    but only updates highlighted (yellow) or selected (cyan) features.
+    """
+    
+    def __init__(self, layer, target_fids, all_selection_fids=None, parent=None):
+        super().__init__(parent)
+        self.layer = layer
+        self.target_fids = set(target_fids)  # Highlighted subset
+        self.all_selection_fids = set(all_selection_fids) if all_selection_fids else set(target_fids)  # All cyan
+        self.active_fids = list(self.target_fids)  # Currently active for operation
+        self.current_feature_idx = 0
+        
+        self.setWindowTitle(f'{layer.name()} — Field Calculator')
+        self.setMinimumSize(850, 650)
+        self.setup_ui()
+        self.load_fields()
+        self.update_preview()
+    
+    def setup_ui(self):
+        main_layout = QVBoxLayout()
+        main_layout.setSpacing(6)
+        self.setLayout(main_layout)
+        
+        # ================== TOP: Target info ==================
+        from qgis.PyQt.QtWidgets import QCheckBox
+        has_highlights = len(self.target_fids) < len(self.all_selection_fids)
+        if has_highlights:
+            self.target_checkbox = QCheckBox(f"Only update {len(self.target_fids)} highlighted feature(s) (uncheck to update all {len(self.all_selection_fids)} selected)")
+            self.target_checkbox.setChecked(True)
+            self.target_checkbox.setEnabled(True)
+            self.target_checkbox.toggled.connect(self.on_target_mode_changed)
+        else:
+            self.target_checkbox = QCheckBox(f"Update all {len(self.all_selection_fids)} selected feature(s)")
+            self.target_checkbox.setChecked(True)
+            self.target_checkbox.setEnabled(False)
+        self.target_checkbox.setStyleSheet("font-weight: bold; color: #1976D2;")
+        main_layout.addWidget(self.target_checkbox)
+        
+        # ================== Field Output Options ==================
+        from qgis.PyQt.QtWidgets import QFrame
+        options_frame = QFrame()
+        options_frame.setFrameShape(QFrame.StyledPanel)
+        options_layout = QHBoxLayout(options_frame)
+        options_layout.setSpacing(20)
+        
+        # LEFT: Create new field
+        new_field_group = QGroupBox("Create a new field")
+        new_field_group.setCheckable(True)
+        new_field_group.setChecked(False)
+        new_field_group.toggled.connect(self.on_create_mode_toggled)
+        self.new_field_group = new_field_group
+        
+        new_layout = QFormLayout()
+        new_layout.setSpacing(4)
+        
+        self.new_field_name = QLineEdit()
+        self.new_field_name.setPlaceholderText("field_name")
+        new_layout.addRow("Output field name:", self.new_field_name)
+        
+        self.new_field_type = QComboBox()
+        self.new_field_type.addItems([
+            "Text (string)", "Whole number (integer)", "Decimal number (double)",
+            "Date", "Boolean"
+        ])
+        new_layout.addRow("Output field type:", self.new_field_type)
+        
+        from qgis.PyQt.QtWidgets import QSpinBox
+        length_layout = QHBoxLayout()
+        self.new_field_length = QSpinBox()
+        self.new_field_length.setRange(1, 254)
+        self.new_field_length.setValue(50)
+        length_layout.addWidget(self.new_field_length)
+        length_layout.addWidget(QLabel("Precision"))
+        self.new_field_precision = QSpinBox()
+        self.new_field_precision.setRange(0, 15)
+        self.new_field_precision.setValue(3)
+        length_layout.addWidget(self.new_field_precision)
+        length_layout.addStretch()
+        new_layout.addRow("Output field length:", length_layout)
+        
+        new_field_group.setLayout(new_layout)
+        options_layout.addWidget(new_field_group, 1)
+        
+        # RIGHT: Update existing field
+        update_group = QGroupBox("Update existing field")
+        update_group.setCheckable(True)
+        update_group.setChecked(True)
+        update_group.toggled.connect(self.on_update_mode_toggled)
+        self.update_group = update_group
+        
+        update_layout = QVBoxLayout()
+        self.field_combo = QComboBox()
+        update_layout.addWidget(self.field_combo)
+        update_layout.addStretch()
+        update_group.setLayout(update_layout)
+        options_layout.addWidget(update_group, 1)
+        
+        main_layout.addWidget(options_frame)
+        
+        # ================== MIDDLE: Expression Builder ==================
+        expr_splitter = QSplitter(Qt.Horizontal)
+        
+        # LEFT PANEL: Expression text + operators
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Expression header with tabs (simplified - just Expression)
+        from qgis.PyQt.QtWidgets import QTabWidget, QTextEdit
+        expr_tabs = QTabWidget()
+        
+        expr_widget = QWidget()
+        expr_tab_layout = QVBoxLayout(expr_widget)
+        expr_tab_layout.setContentsMargins(4, 4, 4, 4)
+        
+        self.expr_edit = QTextEdit()
+        self.expr_edit.setStyleSheet("""
+            QTextEdit {
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 11px;
+                background-color: #FFFEF0;
+                border: 1px solid #ccc;
+            }
+        """)
+        self.expr_edit.setPlaceholderText("Expression...")
+        self.expr_edit.textChanged.connect(self.on_expression_changed)
+        expr_tab_layout.addWidget(self.expr_edit, 1)
+        
+        # Operator buttons
+        ops_layout = QHBoxLayout()
+        ops_layout.setSpacing(2)
+        for op in ['=', '+', '-', '/', '*', '^', '||', '(', ')', "'\\n'"]:
+            btn = QPushButton(op)
+            btn.setFixedSize(28, 24)
+            btn.setStyleSheet("font-size: 11px; padding: 0;")
+            btn.clicked.connect(lambda checked, o=op: self.insert_operator(o))
+            ops_layout.addWidget(btn)
+        ops_layout.addStretch()
+        expr_tab_layout.addLayout(ops_layout)
+        
+        # Feature navigation + Preview
+        nav_layout = QHBoxLayout()
+        nav_layout.addWidget(QLabel("Feature"))
+        self.feature_combo = QComboBox()
+        self.feature_combo.setMinimumWidth(100)
+        self.feature_combo.currentIndexChanged.connect(self.on_feature_changed)
+        nav_layout.addWidget(self.feature_combo)
+        
+        prev_btn = QPushButton("◀")
+        prev_btn.setFixedWidth(24)
+        prev_btn.clicked.connect(self.prev_feature)
+        nav_layout.addWidget(prev_btn)
+        
+        next_btn = QPushButton("▶")
+        next_btn.setFixedWidth(24)
+        next_btn.clicked.connect(self.next_feature)
+        nav_layout.addWidget(next_btn)
+        nav_layout.addStretch()
+        expr_tab_layout.addLayout(nav_layout)
+        
+        # Preview label
+        preview_layout = QHBoxLayout()
+        preview_layout.addWidget(QLabel("Preview:"))
+        self.preview_label = QLabel("")
+        self.preview_label.setStyleSheet("color: #666; font-style: italic;")
+        preview_layout.addWidget(self.preview_label, 1)
+        expr_tab_layout.addLayout(preview_layout)
+        
+        expr_tabs.addTab(expr_widget, "Expression")
+        left_layout.addWidget(expr_tabs)
+        
+        expr_splitter.addWidget(left_panel)
+        
+        # CENTER PANEL: Field list
+        center_panel = QWidget()
+        center_layout = QVBoxLayout(center_panel)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Search
+        search_layout = QHBoxLayout()
+        search_layout.addWidget(QLabel("🔍"))
+        self.field_search = QLineEdit()
+        self.field_search.setPlaceholderText("Search...")
+        self.field_search.textChanged.connect(self.filter_fields)
+        search_layout.addWidget(self.field_search)
+        center_layout.addLayout(search_layout)
+        
+        # Field list
+        self.field_list = QListWidget()
+        self.field_list.setStyleSheet("font-family: monospace; font-size: 11px;")
+        self.field_list.itemDoubleClicked.connect(self.on_field_double_clicked)
+        self.field_list.itemClicked.connect(self.on_field_clicked)
+        center_layout.addWidget(self.field_list)
+        
+        # Function categories (expandable tree)
+        from qgis.PyQt.QtWidgets import QTreeWidget, QTreeWidgetItem
+        self.func_tree = QTreeWidget()
+        self.func_tree.setHeaderHidden(True)
+        self.func_tree.setStyleSheet("font-size: 11px;")
+        
+        # Conditionals
+        cond_item = QTreeWidgetItem(["▾ Conditionals"])
+        for func in ["if(condition, true, false)", "CASE WHEN...THEN...END", "coalesce(a, b)", 
+                     "nullif(a, b)", "try(expr)"]:
+            child = QTreeWidgetItem([func])
+            child.setData(0, Qt.UserRole, func.split("(")[0] + "()" if "(" in func else func)
+            cond_item.addChild(child)
+        self.func_tree.addTopLevelItem(cond_item)
+        
+        # String Functions
+        str_item = QTreeWidgetItem(["▾ String Functions"])
+        for func in ["upper(str)", "lower(str)", "length(str)", "substr(str,start,len)", 
+                     "concat(a,b)", "replace(str,old,new)", "trim(str)", "left(str,n)", "right(str,n)"]:
+            child = QTreeWidgetItem([func])
+            child.setData(0, Qt.UserRole, func)
+            str_item.addChild(child)
+        self.func_tree.addTopLevelItem(str_item)
+        
+        # Math Functions  
+        math_item = QTreeWidgetItem(["▾ Math Functions"])
+        for func in ["abs(x)", "round(x,n)", "floor(x)", "ceil(x)", "sqrt(x)", 
+                     "sin(x)", "cos(x)", "tan(x)", "log(x)", "exp(x)", "pow(x,y)"]:
+            child = QTreeWidgetItem([func])
+            child.setData(0, Qt.UserRole, func)
+            math_item.addChild(child)
+        self.func_tree.addTopLevelItem(math_item)
+        
+        # Date/Time Functions
+        date_item = QTreeWidgetItem(["▾ Date/Time Functions"])
+        for func in ["now()", "day(date)", "month(date)", "year(date)", 
+                     "hour(datetime)", "minute(datetime)", "second(datetime)", "to_date(str)"]:
+            child = QTreeWidgetItem([func])
+            child.setData(0, Qt.UserRole, func)
+            date_item.addChild(child)
+        self.func_tree.addTopLevelItem(date_item)
+        
+        # Geometry Functions
+        geom_item = QTreeWidgetItem(["▾ Geometry Functions"])
+        for func in ["$area", "$length", "$perimeter", "$x", "$y", 
+                     "centroid($geometry)", "buffer($geometry,dist)", "area($geometry)"]:
+            child = QTreeWidgetItem([func])
+            child.setData(0, Qt.UserRole, func)
+            geom_item.addChild(child)
+        self.func_tree.addTopLevelItem(geom_item)
+        
+        # Expand all by default
+        self.func_tree.expandAll()
+        self.func_tree.itemDoubleClicked.connect(self.on_func_double_clicked)
+        self.func_tree.itemClicked.connect(self.on_func_clicked)
+        center_layout.addWidget(self.func_tree)
+        
+        expr_splitter.addWidget(center_panel)
+        
+        # RIGHT PANEL: Help + Values
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Help text
+        self.help_text = QLabel()
+        self.help_text.setWordWrap(True)
+        self.help_text.setStyleSheet("""
+            background-color: #FFF8DC; 
+            padding: 8px; 
+            border: 1px solid #E0D8B8;
+            color: #8B4513;
+        """)
+        self.help_text.setText("<b>group field</b><br><br>Double-click to add field name to expression string.<br><br>Right-Click on field name to open context menu sample value loading options.")
+        self.help_text.setMinimumHeight(80)
+        right_layout.addWidget(self.help_text)
+        
+        # Values section
+        values_group = QGroupBox("Values")
+        values_layout = QVBoxLayout(values_group)
+        
+        self.value_search = QLineEdit()
+        self.value_search.setPlaceholderText("Search...")
+        self.value_search.textChanged.connect(self.filter_values)
+        values_layout.addWidget(self.value_search)
+        
+        btn_layout = QHBoxLayout()
+        all_unique_btn = QPushButton("All Unique")
+        all_unique_btn.clicked.connect(self.load_all_unique_values)
+        btn_layout.addWidget(all_unique_btn)
+        
+        samples_btn = QPushButton("10 Samples")
+        samples_btn.clicked.connect(self.load_sample_values)
+        btn_layout.addWidget(samples_btn)
+        values_layout.addLayout(btn_layout)
+        
+        self.value_list = QListWidget()
+        self.value_list.setStyleSheet("font-size: 11px;")
+        self.value_list.itemDoubleClicked.connect(self.on_value_double_clicked)
+        values_layout.addWidget(self.value_list)
+        
+        right_layout.addWidget(values_group, 1)
+        
+        expr_splitter.addWidget(right_panel)
+        
+        # Set splitter sizes
+        expr_splitter.setSizes([350, 200, 250])
+        main_layout.addWidget(expr_splitter, 1)
+        
+        # ================== BOTTOM: Buttons ==================
+        # Info message (like QGIS)
+        info_frame = QFrame()
+        info_frame.setStyleSheet("background-color: #E3F2FD; padding: 8px; border-radius: 4px;")
+        info_layout = QHBoxLayout(info_frame)
+        info_layout.setContentsMargins(8, 4, 8, 4)
+        info_icon = QLabel("ℹ️")
+        info_layout.addWidget(info_icon)
+        info_text = QLabel(f"Only the {len(self.target_fids)} targeted features will be updated. "
+                          "Non-targeted features will retain their current values.")
+        info_text.setWordWrap(True)
+        info_layout.addWidget(info_text, 1)
+        main_layout.addWidget(info_frame)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        ok_btn = QPushButton("OK")
+        ok_btn.setDefault(True)
+        ok_btn.setMinimumWidth(80)
+        ok_btn.clicked.connect(self.accept)
+        button_layout.addWidget(ok_btn)
+        
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setMinimumWidth(80)
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+        
+        apply_btn = QPushButton("Apply")
+        apply_btn.setMinimumWidth(80)
+        apply_btn.clicked.connect(self.apply_changes)
+        button_layout.addWidget(apply_btn)
+        
+        main_layout.addLayout(button_layout)
+    
+    def load_fields(self):
+        """Load field names into list and combo"""
+        self.field_combo.clear()
+        self.field_list.clear()
+        self.feature_combo.clear()
+        
+        # Type prefixes like QGIS
+        type_prefixes = {
+            'String': 'abc',
+            'Integer': '123',
+            'Real': '1.2',
+            'Double': '1.2',
+            'Date': '📅',
+            'DateTime': '📅',
+        }
+        
+        for field in self.layer.fields():
+            type_name = field.typeName()
+            prefix = type_prefixes.get(type_name, '?')
+            
+            # Add to combo (for update existing)
+            self.field_combo.addItem(f"{prefix} {field.name()}", field.name())
+            
+            # Add to list (for expression builder)
+            item = QListWidgetItem(f"{prefix} {field.name()}")
+            item.setData(Qt.UserRole, field.name())
+            self.field_list.addItem(item)
+        
+        # Load feature names for preview navigation
+        request = QgsFeatureRequest().setFilterFids(self.active_fids[:100])  # Limit for performance
+        for feature in self.layer.getFeatures(request):
+            # Try to get a display value
+            display = str(feature.id())
+            for fname in ['NAME', 'name', 'Name', 'OBJECTID', 'ID', 'id']:
+                if fname in [f.name() for f in self.layer.fields()]:
+                    val = feature.attribute(fname)
+                    if val:
+                        display = str(val)
+                        break
+            self.feature_combo.addItem(display, feature.id())
+    
+    def on_create_mode_toggled(self, checked):
+        if checked and self.update_group.isChecked():
+            self.update_group.setChecked(False)
+        elif not checked and not self.update_group.isChecked():
+            self.update_group.setChecked(True)
+    
+    def on_update_mode_toggled(self, checked):
+        if checked and self.new_field_group.isChecked():
+            self.new_field_group.setChecked(False)
+        elif not checked and not self.new_field_group.isChecked():
+            self.new_field_group.setChecked(True)
+    
+    def insert_operator(self, op):
+        if op == "'\\n'":
+            op = "\\n"
+        self.expr_edit.insertPlainText(f" {op} ")
+    
+    def filter_fields(self, text):
+        for i in range(self.field_list.count()):
+            item = self.field_list.item(i)
+            item.setHidden(text.lower() not in item.text().lower())
+    
+    def filter_values(self, text):
+        for i in range(self.value_list.count()):
+            item = self.value_list.item(i)
+            item.setHidden(text.lower() not in item.text().lower())
+    
+    def on_field_clicked(self, item):
+        field_name = item.data(Qt.UserRole)
+        self.help_text.setText(f"<b>{field_name}</b><br><br>Double-click to add field name to expression string.")
+        self.current_field = field_name
+    
+    def on_field_double_clicked(self, item):
+        field_name = item.data(Qt.UserRole)
+        self.expr_edit.insertPlainText(f'"{field_name}"')
+    
+    def on_func_clicked(self, item, column=0):
+        """Show help for clicked function"""
+        func_text = item.text(0)
+        if item.parent() is None:
+            # Category header clicked
+            if "Conditional" in func_text:
+                self.help_text.setText("<b>Conditionals:</b><br>if(condition, true, false) - returns true value if condition is true, else false value<br><br>CASE WHEN...THEN...END - multiple conditions<br><br>coalesce(a, b) - returns first non-null value")
+            elif "String" in func_text:
+                self.help_text.setText("<b>String Functions:</b><br>upper(), lower(), length(), substr(), concat(), replace(), trim()")
+            elif "Math" in func_text:
+                self.help_text.setText("<b>Math Functions:</b><br>abs(), round(), floor(), ceil(), sqrt(), sin(), cos(), tan()")
+            elif "Date" in func_text:
+                self.help_text.setText("<b>Date/Time Functions:</b><br>now(), day(), month(), year(), hour(), minute()")
+            elif "Geometry" in func_text:
+                self.help_text.setText("<b>Geometry Functions:</b><br>$area, $length, $perimeter, $x, $y, centroid()")
+        else:
+            # Function item clicked - show specific help
+            self.help_text.setText(f"<b>{func_text}</b><br><br>Double-click to insert into expression.")
+    
+    def on_func_double_clicked(self, item, column=0):
+        """Insert function into expression"""
+        if item.parent() is not None:
+            # Only insert child items (actual functions)
+            func_data = item.data(0, Qt.UserRole)
+            if func_data:
+                self.expr_edit.insertPlainText(func_data)
+    
+    def on_target_mode_changed(self, checked):
+        """Toggle between updating highlighted only vs all selected"""
+        if checked:
+            self.active_fids = list(self.target_fids)
+        else:
+            self.active_fids = list(self.all_selection_fids)
+        
+        # Reload features for preview
+        self.feature_combo.clear()
+        request = QgsFeatureRequest().setFilterFids(self.active_fids[:100])
+        for feature in self.layer.getFeatures(request):
+            display = str(feature.id())
+            for fname in ['NAME', 'name', 'Name', 'OBJECTID', 'ID', 'id']:
+                if fname in [f.name() for f in self.layer.fields()]:
+                    val = feature.attribute(fname)
+                    if val:
+                        display = str(val)
+                        break
+            self.feature_combo.addItem(display, feature.id())
+        
+        self.update_preview()
+    
+    def on_value_double_clicked(self, item):
+        value = item.data(Qt.UserRole)
+        if isinstance(value, str):
+            self.expr_edit.insertPlainText(f"'{value}'")
+        else:
+            self.expr_edit.insertPlainText(str(value))
+    
+    def load_all_unique_values(self):
+        self.value_list.clear()
+        if not hasattr(self, 'current_field'):
+            return
+        
+        # Get unique values from targeted features
+        values = set()
+        request = QgsFeatureRequest().setFilterFids(self.active_fids)
+        for feature in self.layer.getFeatures(request):
+            val = feature.attribute(self.current_field)
+            if val is not None:
+                values.add(val)
+        
+        for val in sorted(values, key=str)[:100]:  # Limit display
+            item = QListWidgetItem(str(val))
+            item.setData(Qt.UserRole, val)
+            self.value_list.addItem(item)
+    
+    def load_sample_values(self):
+        self.value_list.clear()
+        if not hasattr(self, 'current_field'):
+            return
+        
+        # Get sample values
+        request = QgsFeatureRequest().setFilterFids(self.active_fids[:10])
+        for feature in self.layer.getFeatures(request):
+            val = feature.attribute(self.current_field)
+            if val is not None:
+                item = QListWidgetItem(str(val))
+                item.setData(Qt.UserRole, val)
+                self.value_list.addItem(item)
+    
+    def on_feature_changed(self, index):
+        self.current_feature_idx = index
+        self.update_preview()
+    
+    def prev_feature(self):
+        if self.current_feature_idx > 0:
+            self.feature_combo.setCurrentIndex(self.current_feature_idx - 1)
+    
+    def next_feature(self):
+        if self.current_feature_idx < self.feature_combo.count() - 1:
+            self.feature_combo.setCurrentIndex(self.current_feature_idx + 1)
+    
+    def on_expression_changed(self):
+        self.update_preview()
+    
+    def update_preview(self):
+        expr_text = self.expr_edit.toPlainText().strip()
+        if not expr_text:
+            self.preview_label.setText("")
+            self.preview_label.setStyleSheet("color: #666;")
+            return
+        
+        fid = self.feature_combo.currentData()
+        if fid is None:
+            return
+        
+        from qgis.core import QgsExpression, QgsExpressionContext, QgsExpressionContextUtils
+        
+        expr = QgsExpression(expr_text)
+        if expr.hasParserError():
+            self.preview_label.setText(f"❌ {expr.parserErrorString()}")
+            self.preview_label.setStyleSheet("color: #c62828;")
+            return
+        
+        context = QgsExpressionContext()
+        context.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(self.layer))
+        
+        feature = self.layer.getFeature(fid)
+        context.setFeature(feature)
+        result = expr.evaluate(context)
+        
+        if expr.hasEvalError():
+            self.preview_label.setText(f"❌ {expr.evalErrorString()}")
+            self.preview_label.setStyleSheet("color: #c62828;")
+        else:
+            self.preview_label.setText(str(result))
+            self.preview_label.setStyleSheet("color: #2e7d32; font-weight: bold;")
+    
+    def apply_changes(self):
+        """Apply changes without closing dialog"""
+        # This would apply the changes
+        # For now, just show a message
+        from qgis.core import QgsMessageLog, Qgis
+        QgsMessageLog.logMessage("Apply clicked", "AdvancedSelection", Qgis.Info)
+    
+    def get_output_field(self):
+        """Get output field name and whether it's new"""
+        if self.new_field_group.isChecked():
+            type_map = {
+                "Text (string)": "String",
+                "Whole number (integer)": "Integer", 
+                "Decimal number (double)": "Double",
+                "Date": "Date",
+                "Boolean": "Boolean"
+            }
+            return (self.new_field_name.text().strip(), 
+                    True, 
+                    type_map.get(self.new_field_type.currentText(), "String"))
+        else:
+            return self.field_combo.currentData(), False, None
+    
+    def get_expression(self):
+        """Get the expression text"""
+        return self.expr_edit.toPlainText().strip()
+    
+    def get_active_fids(self):
+        """Get the active feature IDs to update"""
+        return set(self.active_fids)
+
+class AdvancedSelectionWidget(QWidget):
+    """
+    Professional attribute table widget with two-tier selection:
+    - Cyan background: Original selected features
+    - Yellow background: Highlighted subset for operations
+    
+    Click behaviors (same as standard table selection):
+    - Single click: Replace highlights with clicked row only
+    - Ctrl+Click: Toggle row in/out of highlighted set
+    - Shift+Click: Range selection for highlighting
+    """
+    
+    CYAN_COLOR = QColor(0, 255, 255)        # Original selection (cyan)
+    YELLOW_COLOR = QColor(255, 255, 0)      # Highlighted subset (yellow)
+    
+    highlightChanged = pyqtSignal(set)
+    closed = pyqtSignal()
+    dockRequested = pyqtSignal()  # Signal to request docking
+
+    def __init__(self, layer, iface, plugin_dir, parent=None):
+        super().__init__(parent)
+        self.layer = layer
+        self.iface = iface
+        self.plugin_dir = plugin_dir
+        
+        # Two-tier selection system
+        self.original_selection = set(layer.selectedFeatureIds())  # Cyan rows
+        self.highlighted_features = set()  # Yellow rows (subset)
+        
+        # For clipboard operations
+        self.clipboard_features = []
+        
+        # For shift-click range selection
+        self.last_clicked_row = None
+        
+        # Prevent circular updates
+        self._updating_selection = False
+        self._updating_highlights = False  # Prevent highlight overwrite during programmatic changes
+        
+        # Row to feature ID mapping
+        self.row_to_fid = {}
+        self.fid_to_row = {}
+        
+        # Create rubber bands for map canvas highlighting
+        self.setup_rubber_bands()
+        
+        self.setup_ui()
+        self.populate_table()
+        self.connect_signals()
+        self.update_button_states()
+        
+        # Initial map highlight
+        self.update_map_highlighting()
+    
+    def setup_rubber_bands(self):
+        """Create rubber bands for map canvas feature highlighting"""
+        canvas = self.iface.mapCanvas()
+        
+        # Determine geometry type for rubber band
+        geom_type = self.layer.geometryType()
+        
+        # Cyan rubber band for original selection (background)
+        self.cyan_rubber_band = QgsRubberBand(canvas, geom_type)
+        self.cyan_rubber_band.setColor(QColor(0, 255, 255, 180))  # Cyan with transparency
+        self.cyan_rubber_band.setFillColor(QColor(0, 255, 255, 100))
+        self.cyan_rubber_band.setWidth(2)
+        
+        # Yellow rubber band for highlighted features (foreground)
+        self.yellow_rubber_band = QgsRubberBand(canvas, geom_type)
+        self.yellow_rubber_band.setColor(QColor(255, 255, 0, 255))  # Bright yellow
+        self.yellow_rubber_band.setFillColor(QColor(255, 255, 0, 150))
+        self.yellow_rubber_band.setWidth(3)
+
+    def setup_ui(self):
+        """Build the widget UI"""
+        layout = QVBoxLayout()
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+        self.setLayout(layout)
+        
+        # Info label showing counts
+        self.info_label = QLabel()
+        self.info_label.setStyleSheet("font-size: 11px; padding: 3px; background-color: #f0f0f0; border-radius: 2px;")
+        self.update_info_label()
+        layout.addWidget(self.info_label)
+        
+        # Toolbar
+        self.toolbar = QToolBar()
+        self.toolbar.setMovable(False)
+        self.toolbar.setIconSize(self.toolbar.iconSize() * 0.85)
+        layout.addWidget(self.toolbar)
+        
+        # Create custom table widget with stylesheet to override selection colors
+        self.table_widget = QTableWidget()
+        self.table_widget.setAlternatingRowColors(False)
+        self.table_widget.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table_widget.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+        self.table_widget.horizontalHeader().setStretchLastSection(True)
+        self.table_widget.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table_widget.verticalHeader().setDefaultSectionSize(22)
+        self.table_widget.verticalHeader().setVisible(True)
+        
+        # Install custom delegate to override Qt's selection highlighting
+        self.delegate = HighlightDelegate(self, self.table_widget)
+        self.table_widget.setItemDelegate(self.delegate)
+        
+        layout.addWidget(self.table_widget)
+        
+        # Create toolbar actions
+        self.create_actions()
+        
+        # Help label
+        help_label = QLabel(
+            "<small><b>Click</b>: Select | <b>Ctrl+Click</b>: Add/Remove | "
+            "<b>Shift+Click</b>: Range | <b>Double-Click</b>: Edit (when editing) | "
+            "<b>Yellow</b> = Highlighted for operations</small>"
+        )
+        help_label.setStyleSheet("color: #666; padding: 2px; font-size: 10px;")
+        layout.addWidget(help_label)
+
+    def create_actions(self):
+        """Create toolbar actions"""
+        # Clear Highlights action
+        self.action_clear_highlights = QAction(
+            self.get_icon('icons/clear_highlight.png'), 
+            'Clear Highlights', self
+        )
+        self.action_clear_highlights.setToolTip('Clear all yellow highlights')
+        self.action_clear_highlights.triggered.connect(self.clear_highlights)
+        self.toolbar.addAction(self.action_clear_highlights)
+        
+        # Highlight All action
+        self.action_highlight_all = QAction(
+            self.get_icon('icons/highlight_all.png'), 
+            'Highlight All', self
+        )
+        self.action_highlight_all.setToolTip('Highlight all rows')
+        self.action_highlight_all.triggered.connect(self.highlight_all)
+        self.toolbar.addAction(self.action_highlight_all)
+        
+        # Re-select to Highlighted action (narrow selection to highlighted subset)
+        self.action_reselect = QAction(
+            self.get_icon('icons/reselect.png'), 
+            'Re-select to Highlighted', self
+        )
+        self.action_reselect.setToolTip('Make highlighted features the new selection (narrow down)')
+        self.action_reselect.triggered.connect(self.reselect_to_highlighted)
+        self.toolbar.addAction(self.action_reselect)
+        
+        self.toolbar.addSeparator()
+        self.action_select_expr = QAction(
+            self.get_icon('icons/select_expression.png'), 
+            'Select by Expression', self
+        )
+        self.action_select_expr.setToolTip('Filter by expression')
+        self.action_select_expr.triggered.connect(self.select_by_expression)
+        self.toolbar.addAction(self.action_select_expr)
+        
+        # Invert Selection
+        self.action_invert = QAction(
+            QgsApplication.getThemeIcon('/mActionInvertSelection.svg'), 
+            'Invert Highlights', self
+        )
+        self.action_invert.setToolTip('Invert highlights')
+        self.action_invert.triggered.connect(self.invert_highlights)
+        self.toolbar.addAction(self.action_invert)
+        
+        self.toolbar.addSeparator()
+        
+        # Delete action
+        self.action_delete = QAction(
+            QgsApplication.getThemeIcon('/mActionDeleteSelectedFeatures.svg'), 
+            'Delete', self
+        )
+        self.action_delete.setToolTip('Delete highlighted features')
+        self.action_delete.triggered.connect(self.delete_features)
+        self.toolbar.addAction(self.action_delete)
+        
+        # Cut action
+        self.action_cut = QAction(
+            QgsApplication.getThemeIcon('/mActionEditCut.svg'), 
+            'Cut', self
+        )
+        self.action_cut.triggered.connect(self.cut_features)
+        self.toolbar.addAction(self.action_cut)
+        
+        # Copy action
+        self.action_copy = QAction(
+            QgsApplication.getThemeIcon('/mActionEditCopy.svg'), 
+            'Copy', self
+        )
+        self.action_copy.triggered.connect(self.copy_features)
+        self.toolbar.addAction(self.action_copy)
+        
+        # Paste action
+        self.action_paste = QAction(
+            QgsApplication.getThemeIcon('/mActionEditPaste.svg'), 
+            'Paste', self
+        )
+        self.action_paste.triggered.connect(self.paste_features)
+        self.toolbar.addAction(self.action_paste)
+        
+        self.toolbar.addSeparator()
+        
+        # Zoom to highlighted
+        self.action_zoom = QAction(
+            QgsApplication.getThemeIcon('/mActionZoomToSelected.svg'), 
+            'Zoom to Highlighted', self
+        )
+        self.action_zoom.setToolTip('Zoom to highlighted features')
+        self.action_zoom.triggered.connect(self.zoom_to_highlighted)
+        self.toolbar.addAction(self.action_zoom)
+        
+        # Refresh
+        self.action_refresh = QAction(
+            QgsApplication.getThemeIcon('/mActionRefresh.svg'), 
+            'Refresh', self
+        )
+        self.action_refresh.triggered.connect(self.refresh_table)
+        self.toolbar.addAction(self.action_refresh)
+        
+        # Field Calculator
+        self.action_field_calc = QAction(
+            QgsApplication.getThemeIcon('/mActionCalculateField.svg'), 
+            'Field Calculator', self
+        )
+        self.action_field_calc.setToolTip('Open Field Calculator for targeted features')
+        self.action_field_calc.triggered.connect(self.open_field_calculator)
+        self.toolbar.addAction(self.action_field_calc)
+        
+        self.toolbar.addSeparator()
+        
+        # Dock Attribute Table action
+        self.action_dock = QAction(
+            self.get_icon('icons/dock_table.png'), 
+            'Dock Attribute Table', self
+        )
+        self.action_dock.setToolTip('Dock this table to QGIS (like original attribute table)')
+        self.action_dock.triggered.connect(self.request_dock)
+        self.toolbar.addAction(self.action_dock)
+    
+    def request_dock(self):
+        """Request docking of this widget"""
+        self.dockRequested.emit()
+
+    def populate_table(self):
+        """Populate the table with features from original selection"""
+        # Block signals to prevent spurious cellChanged during populate
+        self.table_widget.blockSignals(True)
+        
+        self.table_widget.clear()
+        self.row_to_fid.clear()
+        self.fid_to_row.clear()
+        
+        if not self.original_selection:
+            self.table_widget.blockSignals(False)
+            return
+        
+        # Get field names
+        fields = self.layer.fields()
+        field_names = [field.name() for field in fields]
+        
+        # Setup columns
+        self.table_widget.setColumnCount(len(field_names))
+        self.table_widget.setHorizontalHeaderLabels(field_names)
+        
+        # Get features
+        request = QgsFeatureRequest().setFilterFids(list(self.original_selection))
+        features = list(self.layer.getFeatures(request))
+        
+        self.table_widget.setRowCount(len(features))
+        
+        # Determine if cells should be editable
+        is_editable = self.layer.isEditable()
+        
+        for row, feature in enumerate(features):
+            fid = feature.id()
+            self.row_to_fid[row] = fid
+            self.fid_to_row[fid] = row
+            
+            # Set row number in vertical header
+            header_item = QTableWidgetItem(str(row + 1))
+            self.table_widget.setVerticalHeaderItem(row, header_item)
+            
+            for col, field_name in enumerate(field_names):
+                value = feature.attribute(field_name)
+                item = QTableWidgetItem(str(value) if value is not None else '')
+                
+                # Store field name for use in cell editing
+                item.setData(Qt.UserRole, field_name)
+                
+                # Make cell editable only if layer is in edit mode
+                if is_editable:
+                    item.setFlags(item.flags() | Qt.ItemIsEditable)
+                else:
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                
+                self.table_widget.setItem(row, col, item)
+        
+        # Auto-resize columns to content
+        self.table_widget.resizeColumnsToContents()
+        
+        # Unblock signals after population is complete
+        self.table_widget.blockSignals(False)
+
+    def connect_signals(self):
+        """Connect layer signals and table signals"""
+        self.layer.selectionChanged.connect(self.on_layer_selection_changed)
+        self.layer.featuresDeleted.connect(self.on_features_deleted)
+        self.layer.editingStarted.connect(self.on_editing_mode_changed)
+        self.layer.editingStopped.connect(self.on_editing_mode_changed)
+        
+        # Connect to selection change signal
+        self.table_widget.itemSelectionChanged.connect(self.on_table_selection_changed)
+        
+        # Connect cell changes for inline editing
+        self.table_widget.cellChanged.connect(self.on_cell_changed)
+
+    def on_editing_mode_changed(self):
+        """Handle editing mode changes - refresh table to update cell editability"""
+        # Preserve highlighted features
+        saved_highlights = self.highlighted_features.copy()
+        
+        self.populate_table()
+        
+        # Restore highlights
+        self.highlighted_features = saved_highlights
+        
+        # Re-select highlighted rows in table
+        self._updating_highlights = True
+        try:
+            from qgis.PyQt.QtCore import QItemSelectionModel
+            selection_model = self.table_widget.selectionModel()
+            for fid in self.highlighted_features:
+                row = self.get_row_for_fid(fid)
+                if row is not None:
+                    index = self.table_widget.model().index(row, 0)
+                    selection_model.select(index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+        finally:
+            self._updating_highlights = False
+        
+        self.table_widget.viewport().update()
+        self.update_button_states()
+        self.update_map_highlighting()
+    
+    def on_cell_changed(self, row, col):
+        """Handle cell value changes - commit to layer"""
+        if not self.layer.isEditable():
+            return
+        
+        fid = self.get_fid_for_row(row)
+        if fid is None:
+            return
+        
+        item = self.table_widget.item(row, col)
+        if item is None:
+            return
+        
+        field_name = item.data(Qt.UserRole)
+        if not field_name:
+            return
+        
+        new_value = item.text()
+        
+        # Get field index
+        field_idx = self.layer.fields().indexFromName(field_name)
+        if field_idx < 0:
+            return
+        
+        # Update layer attribute
+        self.layer.changeAttributeValue(fid, field_idx, new_value if new_value else None)
+
+    def on_table_selection_changed(self):
+        """Handle table selection changes - sync with highlighted features"""
+        # Skip if we're in programmatic update mode
+        if self._updating_highlights:
+            return
+        
+        # Get all selected rows from the table's selection model
+        selected_rows = set()
+        for index in self.table_widget.selectionModel().selectedRows():
+            selected_rows.add(index.row())
+        
+        # Also check selected items (for when clicking cells)
+        for item in self.table_widget.selectedItems():
+            selected_rows.add(item.row())
+        
+        # Convert rows to feature IDs
+        new_highlighted = set()
+        for row in selected_rows:
+            fid = self.get_fid_for_row(row)
+            if fid is not None:
+                new_highlighted.add(fid)
+        
+        # Update highlighted features
+        if new_highlighted != self.highlighted_features:
+            self.highlighted_features = new_highlighted
+            # Force repaint to show new colors via delegate
+            self.table_widget.viewport().update()
+            self.update_info_label()
+            self.update_button_states()
+            self.update_map_highlighting()
+            self.highlightChanged.emit(self.highlighted_features)
+            
+            # Update last clicked row for shift-click
+            if selected_rows:
+                self.last_clicked_row = max(selected_rows)
+
+    def get_fid_for_row(self, row):
+        """Get feature ID for a given row"""
+        return self.row_to_fid.get(row, None)
+
+    def get_row_for_fid(self, fid):
+        """Get row index for a given feature ID"""
+        return self.fid_to_row.get(fid, None)
+
+    def get_icon(self, icon_name):
+        """Get icon from plugin directory"""
+        icon_path = os.path.join(self.plugin_dir, icon_name)
+        if os.path.exists(icon_path):
+            return QIcon(icon_path)
+        icon_path = os.path.join(self.plugin_dir, 'icons', icon_name)
+        if os.path.exists(icon_path):
+            return QIcon(icon_path)
+        return QIcon()
+
+    def update_info_label(self):
+        """Update the info label with counts"""
+        orig = len(self.original_selection)
+        high = len(self.highlighted_features)
+        
+        text = f'<b style="color:#008B8B;">Cyan:</b> {orig}'
+        if high > 0:
+            text += f' | <b style="color:#DAA520;">Yellow:</b> {high}'
+        else:
+            text += ' | <span style="color:#888;">Click rows to highlight</span>'
+        
+        self.info_label.setText(text)
+
+    def update_button_states(self):
+        """Update enabled state and tooltips of toolbar buttons"""
+        has_highlights = len(self.highlighted_features) > 0
+        has_selection = len(self.original_selection) > 0
+        has_clipboard = len(self.clipboard_features) > 0
+        is_editable = self.layer.isEditable()
+        
+        # Determine target description for tooltips
+        if has_highlights:
+            target_count = len(self.highlighted_features)
+            target_desc = f"{target_count} highlighted (yellow)"
+        else:
+            target_count = len(self.original_selection)
+            target_desc = f"{target_count} selected (cyan)"
+        
+        self.action_clear_highlights.setEnabled(has_highlights)
+        self.action_highlight_all.setEnabled(has_selection)
+        self.action_reselect.setEnabled(has_highlights)
+        self.action_select_expr.setEnabled(has_selection)
+        self.action_invert.setEnabled(has_selection)
+        
+        # Destructive actions require edit mode
+        can_delete = (has_highlights or has_selection) and is_editable
+        self.action_delete.setEnabled(can_delete)
+        if is_editable:
+            self.action_delete.setToolTip(f'Delete {target_desc} features')
+        else:
+            self.action_delete.setToolTip(f'Delete {target_desc} features (enable editing first!)')
+        
+        can_cut = (has_highlights or has_selection) and is_editable
+        self.action_cut.setEnabled(can_cut)
+        if is_editable:
+            self.action_cut.setToolTip(f'Cut {target_desc} features')
+        else:
+            self.action_cut.setToolTip(f'Cut {target_desc} features (enable editing first!)')
+        
+        # Copy doesn't require edit mode
+        self.action_copy.setEnabled(has_highlights or has_selection)
+        self.action_copy.setToolTip(f'Copy {target_desc} features')
+        
+        # Paste requires edit mode
+        can_paste = has_clipboard and is_editable
+        self.action_paste.setEnabled(can_paste)
+        if is_editable:
+            self.action_paste.setToolTip(f'Paste {len(self.clipboard_features)} features')
+        else:
+            self.action_paste.setToolTip(f'Paste {len(self.clipboard_features)} features (enable editing first!)')
+        
+        self.action_zoom.setEnabled(has_highlights or has_selection)
+        self.action_zoom.setToolTip(f'Zoom to {target_desc} features')
+        
+        self.action_invert.setToolTip(f'Invert highlights (will highlight {len(self.original_selection) - len(self.highlighted_features)} features)')
+        
+        # Field calculator requires edit mode for updates
+        if hasattr(self, 'action_field_calc'):
+            self.action_field_calc.setEnabled(has_highlights or has_selection)
+            if is_editable:
+                self.action_field_calc.setToolTip(f'Open Field Calculator for {target_desc} features')
+            else:
+                self.action_field_calc.setToolTip(f'Open Field Calculator for {target_desc} features (read-only preview, enable editing to modify)')
+
+    def get_target_features(self):
+        """Get features to operate on (highlighted first, then all)"""
+        if self.highlighted_features:
+            return self.highlighted_features.copy()
+        return self.original_selection.copy()
+    
+    def update_map_highlighting(self):
+        """Update rubber bands on map canvas to show cyan/yellow features"""
+        # Clear existing rubber bands
+        self.cyan_rubber_band.reset(self.layer.geometryType())
+        self.yellow_rubber_band.reset(self.layer.geometryType())
+        
+        # Get features for cyan (original selection minus highlighted)
+        cyan_fids = self.original_selection - self.highlighted_features
+        
+        # Add cyan geometries (original selection not highlighted)
+        if cyan_fids:
+            request = QgsFeatureRequest().setFilterFids(list(cyan_fids))
+            for feature in self.layer.getFeatures(request):
+                geom = feature.geometry()
+                if geom and not geom.isNull():
+                    self.cyan_rubber_band.addGeometry(geom, self.layer)
+        
+        # Add yellow geometries (highlighted features)
+        if self.highlighted_features:
+            request = QgsFeatureRequest().setFilterFids(list(self.highlighted_features))
+            for feature in self.layer.getFeatures(request):
+                geom = feature.geometry()
+                if geom and not geom.isNull():
+                    self.yellow_rubber_band.addGeometry(geom, self.layer)
+        
+        # Refresh canvas
+        self.iface.mapCanvas().refresh()
+    
+    def cleanup_rubber_bands(self):
+        """Remove rubber bands from map canvas (called on close)"""
+        if hasattr(self, 'cyan_rubber_band') and self.cyan_rubber_band:
+            self.cyan_rubber_band.reset()
+            self.iface.mapCanvas().scene().removeItem(self.cyan_rubber_band)
+        if hasattr(self, 'yellow_rubber_band') and self.yellow_rubber_band:
+            self.yellow_rubber_band.reset()
+            self.iface.mapCanvas().scene().removeItem(self.yellow_rubber_band)
+        self.iface.mapCanvas().refresh()
+    
+    def reselect_to_highlighted(self):
+        """Narrow selection down to highlighted features only"""
+        if not self.highlighted_features:
+            self.iface.messageBar().pushInfo('Selection', 'No features highlighted to re-select.')
+            return
+        
+        # Make highlighted become the new original selection
+        self.original_selection = self.highlighted_features.copy()
+        self.highlighted_features.clear()
+        
+        # Update layer selection
+        self._updating_selection = True
+        self.layer.selectByIds(list(self.original_selection))
+        self._updating_selection = False
+        
+        # Refresh table with new selection
+        self.populate_table()
+        self.table_widget.viewport().update()
+        self.update_info_label()
+        self.update_button_states()
+        self.update_map_highlighting()
+        
+        self.iface.messageBar().pushSuccess(
+            'Re-select', 
+            f'Selection narrowed to {len(self.original_selection)} features.'
+        )
+
+    # ==================== Actions ====================
+
+    def clear_highlights(self):
+        """Clear all yellow highlights"""
+        if not self.highlighted_features:
+            return
+        count = len(self.highlighted_features)
+        self.highlighted_features.clear()
+        self.last_clicked_row = None
+        self.table_widget.clearSelection()
+        self.table_widget.viewport().update()
+        self.update_info_label()
+        self.update_button_states()
+        self.update_map_highlighting()
+        self.iface.messageBar().pushInfo('Selection', f'Cleared {count} highlights.')
+
+    def highlight_all(self):
+        """Highlight all features"""
+        self.highlighted_features = self.original_selection.copy()
+        self.table_widget.selectAll()
+        self.table_widget.viewport().update()
+        self.update_info_label()
+        self.update_button_states()
+        self.update_map_highlighting()
+        self.iface.messageBar().pushSuccess('Selection', f'Highlighted {len(self.highlighted_features)} features.')
+
+    def select_by_expression(self):
+        """Open custom filter dialog that only shows values from selected features"""
+        if not self.original_selection:
+            self.iface.messageBar().pushInfo('Filter', 'No features selected to filter.')
+            return
+        
+        # Use our custom dialog that only shows values from cyan selection
+        dialog = SelectionFilterDialog(self.layer, self.original_selection, self)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            expr_text = dialog.get_expression()
+            if expr_text:
+                from qgis.core import QgsExpression, QgsExpressionContext, QgsExpressionContextUtils
+                
+                # Create and prepare expression
+                expr = QgsExpression(expr_text)
+                if expr.hasParserError():
+                    self.iface.messageBar().pushCritical('Filter', f'Expression error: {expr.parserErrorString()}')
+                    return
+                
+                # Create context
+                context = QgsExpressionContext()
+                context.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(self.layer))
+                
+                # Get features from selection and evaluate manually
+                request = QgsFeatureRequest().setFilterFids(list(self.original_selection))
+                matching_fids = set()
+                
+                for feature in self.layer.getFeatures(request):
+                    context.setFeature(feature)
+                    result = expr.evaluate(context)
+                    if result:
+                        matching_fids.add(feature.id())
+                
+                self.highlighted_features = matching_fids
+                
+                # Use selection model to select multiple rows
+                # Block the signal handler during programmatic changes
+                from qgis.PyQt.QtCore import QItemSelectionModel
+                self._updating_highlights = True
+                try:
+                    self.table_widget.clearSelection()
+                    selection_model = self.table_widget.selectionModel()
+                    for fid in matching_fids:
+                        row = self.get_row_for_fid(fid)
+                        if row is not None:
+                            index = self.table_widget.model().index(row, 0)
+                            selection_model.select(index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+                finally:
+                    self._updating_highlights = False
+                
+                self.table_widget.viewport().update()
+                self.update_info_label()
+                self.update_button_states()
+                self.update_map_highlighting()
+                self.iface.messageBar().pushSuccess('Filter', f'Highlighted {len(matching_fids)} features.')
+
+    def invert_highlights(self):
+        """Invert highlights within original selection"""
+        if not self.original_selection:
+            return
+        
+        self.highlighted_features = self.original_selection - self.highlighted_features
+        
+        # Use selection model to select multiple rows
+        # Block the signal handler during programmatic changes
+        from qgis.PyQt.QtCore import QItemSelectionModel
+        self._updating_highlights = True
+        try:
+            self.table_widget.clearSelection()
+            selection_model = self.table_widget.selectionModel()
+            for fid in self.highlighted_features:
+                row = self.get_row_for_fid(fid)
+                if row is not None:
+                    index = self.table_widget.model().index(row, 0)
+                    selection_model.select(index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+        finally:
+            self._updating_highlights = False
+        
+        self.table_widget.viewport().update()
+        self.update_info_label()
+        self.update_button_states()
+        self.update_map_highlighting()
+        self.iface.messageBar().pushInfo('Selection', f'Inverted: {len(self.highlighted_features)} highlighted.')
+
+    def delete_features(self):
+        """Delete target features"""
+        fids = self.get_target_features()
+        if not fids:
+            return
+        
+        target_type = "highlighted" if self.highlighted_features else "all selected"
+        
+        reply = QMessageBox.question(
+            self, 'Delete Features',
+            f'Delete {len(fids)} {target_type} features?',
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        was_editing = self.layer.isEditable()
+        if not was_editing:
+            self.layer.startEditing()
+        
+        if self.layer.deleteFeatures(list(fids)):
+            if not was_editing:
+                self.layer.commitChanges()
+            
+            self.original_selection -= fids
+            self.highlighted_features -= fids
+            
+            self.populate_table()
+            self.table_widget.viewport().update()
+            self.update_info_label()
+            self.update_button_states()
+            
+            self._updating_selection = True
+            self.layer.selectByIds(list(self.original_selection))
+            self._updating_selection = False
+            
+            self.iface.messageBar().pushSuccess('Delete', f'Deleted {len(fids)} features.')
+        else:
+            if not was_editing:
+                self.layer.rollBack()
+            QMessageBox.warning(self, 'Error', 'Failed to delete features.')
+
+    def cut_features(self):
+        """Cut features"""
+        self.copy_features()
+        self.delete_features()
+
+    def copy_features(self):
+        """Copy target features"""
+        fids = self.get_target_features()
+        if not fids:
+            return
+        
+        self.clipboard_features = []
+        request = QgsFeatureRequest().setFilterFids(list(fids))
+        for feature in self.layer.getFeatures(request):
+            self.clipboard_features.append(QgsFeature(feature))
+        
+        self.update_button_states()
+        self.iface.messageBar().pushSuccess('Copy', f'Copied {len(self.clipboard_features)} features.')
+
+    def paste_features(self):
+        """Paste features"""
+        if not self.clipboard_features:
+            return
+        
+        was_editing = self.layer.isEditable()
+        if not was_editing:
+            self.layer.startEditing()
+        
+        success, new_features = self.layer.dataProvider().addFeatures(self.clipboard_features)
+        
+        if success:
+            if not was_editing:
+                self.layer.commitChanges()
+            self.iface.messageBar().pushSuccess('Paste', f'Pasted {len(new_features)} features.')
+            self.refresh_table()
+        else:
+            if not was_editing:
+                self.layer.rollBack()
+            QMessageBox.warning(self, 'Error', 'Failed to paste features.')
+
+    def zoom_to_highlighted(self):
+        """Zoom to target features"""
+        fids = self.get_target_features()
+        if not fids:
+            return
+        
+        self._updating_selection = True
+        self.layer.selectByIds(list(fids))
+        self._updating_selection = False
+        
+        self.iface.mapCanvas().zoomToSelected(self.layer)
+
+    def open_field_calculator(self):
+        """Open field calculator for targeted features"""
+        fids = self.get_target_features()
+        if not fids and not self.original_selection:
+            self.iface.messageBar().pushInfo('Field Calculator', 'No features selected.')
+            return
+        
+        # Pass both highlighted and all selected, so user can choose
+        target_fids = fids if fids else self.original_selection
+        dialog = FieldCalculatorDialog(self.layer, target_fids, self.original_selection, self)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            expr_text = dialog.get_expression()
+            field_name, is_new, field_type = dialog.get_output_field()
+            active_fids = dialog.get_active_fids()  # Respects checkbox state
+            
+            if not expr_text or not field_name:
+                self.iface.messageBar().pushWarning('Field Calculator', 'Missing expression or field name.')
+                return
+            
+            # Check if layer is editable
+            was_editing = self.layer.isEditable()
+            if not was_editing:
+                self.layer.startEditing()
+            
+            try:
+                from qgis.core import QgsExpression, QgsExpressionContext, QgsExpressionContextUtils, QgsField
+                from qgis.PyQt.QtCore import QVariant
+                
+                # Create new field if needed
+                if is_new:
+                    if field_type == 'String':
+                        qfield = QgsField(field_name, QVariant.String, 'string', 254)
+                    elif field_type == 'Integer':
+                        qfield = QgsField(field_name, QVariant.Int, 'integer')
+                    else:  # Double
+                        qfield = QgsField(field_name, QVariant.Double, 'double')
+                    
+                    if not self.layer.dataProvider().addAttributes([qfield]):
+                        raise Exception("Failed to add new field")
+                    self.layer.updateFields()
+                
+                # Get field index
+                field_idx = self.layer.fields().indexFromName(field_name)
+                if field_idx < 0:
+                    raise Exception(f"Field '{field_name}' not found")
+                
+                # Create expression
+                expr = QgsExpression(expr_text)
+                if expr.hasParserError():
+                    raise Exception(f"Expression error: {expr.parserErrorString()}")
+                
+                context = QgsExpressionContext()
+                context.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(self.layer))
+                
+                # Update only active features (from dialog)
+                request = QgsFeatureRequest().setFilterFids(list(active_fids))
+                updated_count = 0
+                
+                for feature in self.layer.getFeatures(request):
+                    context.setFeature(feature)
+                    result = expr.evaluate(context)
+                    
+                    if expr.hasEvalError():
+                        continue
+                    
+                    self.layer.changeAttributeValue(feature.id(), field_idx, result)
+                    updated_count += 1
+                
+                if not was_editing:
+                    self.layer.commitChanges()
+                
+                self.refresh_table()
+                self.iface.messageBar().pushSuccess(
+                    'Field Calculator', 
+                    f'Updated {updated_count} features in field "{field_name}".'
+                )
+                
+            except Exception as e:
+                if not was_editing:
+                    self.layer.rollBack()
+                QMessageBox.critical(self, 'Field Calculator Error', str(e))
+
+
+    def refresh_table(self):
+        """Refresh the table from layer - syncs with current layer selection"""
+        current_selection = set(self.layer.selectedFeatureIds())
+        
+        if current_selection:
+            self.original_selection = current_selection
+        
+        self.highlighted_features &= self.original_selection
+        
+        self.populate_table()
+        self.table_widget.viewport().update()
+        self.update_info_label()
+        self.update_button_states()
+        self.update_map_highlighting()
+
+    # ==================== Signal Handlers ====================
+
+    def on_layer_selection_changed(self, selected, deselected, clearAndSelect):
+        """Handle layer selection changes from outside (e.g., from main attribute table)
+        
+        This provides seamless two-way synchronization:
+        - When user changes selection in main QGIS, this updates cyan rows here
+        - When user uses Re-select here, the layer selection is updated there
+        """
+        if self._updating_selection:
+            return
+        
+        new_selection = set(self.layer.selectedFeatureIds())
+        
+        # Only update if selection actually changed
+        if new_selection != self.original_selection:
+            self.original_selection = new_selection
+            # Keep only highlights that are still in the new selection
+            self.highlighted_features &= self.original_selection
+            
+            # Refresh table with new selection
+            self.populate_table()
+            self.table_widget.viewport().update()
+            self.update_info_label()
+            self.update_button_states()
+            
+            # Update map highlighting to reflect new selection
+            self.update_map_highlighting()
+            
+            # Notify user of sync
+            self.iface.messageBar().pushInfo(
+                'Sync', 
+                f'Selection updated: {len(self.original_selection)} features'
+            )
+
+    def on_features_deleted(self, fids):
+        """Handle features deleted from layer"""
+        deleted = set(fids)
+        self.original_selection -= deleted
+        self.highlighted_features -= deleted
+        self.populate_table()
+        self.table_widget.viewport().update()
+        self.update_info_label()
+        self.update_button_states()
+        self.update_map_highlighting()
+
+
+class AdvancedSelectionDock(QDockWidget):
+    """Dockable wrapper for the Advanced Selection Widget"""
+    
+    closed = pyqtSignal()
+    undockRequested = pyqtSignal()  # Signal to convert back to floating dialog
+    
+    def __init__(self, layer, iface, plugin_dir, parent=None):
+        super().__init__(f'Selection Table - {layer.name()}', parent)
+        self.layer = layer
+        self.iface = iface
+        self.plugin_dir = plugin_dir
+        
+        # Set dock features
+        self.setAllowedAreas(Qt.TopDockWidgetArea | Qt.BottomDockWidgetArea | 
+                            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.setFeatures(QDockWidget.DockWidgetClosable | 
+                        QDockWidget.DockWidgetMovable | 
+                        QDockWidget.DockWidgetFloatable)
+        
+        # Create the main widget
+        self.selection_widget = AdvancedSelectionWidget(layer, iface, plugin_dir, self)
+        self.setWidget(self.selection_widget)
+        
+        # Hide the dock button (already docked) and replace with undock button
+        self.selection_widget.action_dock.setVisible(False)
+        
+        # Add undock action to toolbar
+        self.action_undock = QAction(
+            QIcon(os.path.join(plugin_dir, 'icons', 'undock.png')),
+            'Undock (Float Window)', self.selection_widget
+        )
+        self.action_undock.setToolTip('Convert to floating window')
+        self.action_undock.triggered.connect(self.request_undock)
+        self.selection_widget.toolbar.addAction(self.action_undock)
+        
+        # Set minimum size
+        self.setMinimumWidth(400)
+        self.setMinimumHeight(200)
+    
+    def request_undock(self):
+        """Request conversion to floating dialog"""
+        self.undockRequested.emit()
+    
+    def closeEvent(self, event):
+        """Handle close event"""
+        # Clean up rubber bands from map canvas
+        self.selection_widget.cleanup_rubber_bands()
+        
+        # Restore original selection on close
+        if self.selection_widget.original_selection:
+            self.selection_widget._updating_selection = True
+            self.layer.selectByIds(list(self.selection_widget.original_selection))
+            self.selection_widget._updating_selection = False
+        
+        self.closed.emit()
+        event.accept()
+
+
+# Keep backward compatibility with dialog mode
+class AdvancedSelectionDialog(QDialog):
+    """Dialog wrapper for standalone mode"""
+    
+    highlightChanged = pyqtSignal(set)
+    dockRequested = pyqtSignal()  # Signal to convert to dock
+    
+    def __init__(self, layer, iface, plugin_dir, parent=None):
+        super().__init__(parent)
+        self.layer = layer
+        self.iface = iface
+        self.plugin_dir = plugin_dir
+        self.setWindowTitle(f'Advanced Selection Table - {layer.name()}')
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint)
+        self.resize(1100, 650)
+        
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.setLayout(layout)
+        
+        self.selection_widget = AdvancedSelectionWidget(layer, iface, plugin_dir, self)
+        layout.addWidget(self.selection_widget)
+        
+        self.selection_widget.highlightChanged.connect(self.highlightChanged.emit)
+        self.selection_widget.dockRequested.connect(self.on_dock_requested)
+    
+    def on_dock_requested(self):
+        """Handle dock request from widget - emit signal for plugin to handle"""
+        self.dockRequested.emit()
+    
+    @property
+    def original_selection(self):
+        return self.selection_widget.original_selection
+    
+    @property
+    def highlighted_features(self):
+        return self.selection_widget.highlighted_features
+    
+    def closeEvent(self, event):
+        """Restore original selection on close and cleanup rubber bands"""
+        # Clean up rubber bands from map canvas
+        self.selection_widget.cleanup_rubber_bands()
+        
+        if self.selection_widget.original_selection:
+            self.selection_widget._updating_selection = True
+            self.layer.selectByIds(list(self.selection_widget.original_selection))
+            self.selection_widget._updating_selection = False
+        event.accept()
+

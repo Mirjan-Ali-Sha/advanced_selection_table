@@ -1,0 +1,64 @@
+[general]
+name=Advanced Selection Table
+qgisMinimumVersion=3.0
+description=Professional attribute table with two-tier selection (Cyan = Selected, Yellow = Highlighted) for advanced feature filtering and editing
+version=2.1.0
+author=Mirjan Ali Sha
+email=mastools.help@gmail.com
+
+about=Advanced Selection Table is a powerful QGIS plugin that provides a professional attribute table experience with a unique two-tier selection system designed for efficient feature management and editing workflows.
+
+    KEY FEATURES:
+    • Two-Tier Selection System: Cyan background shows your original layer selection, Yellow highlighting marks the subset you want to work with
+    • Advanced Field Calculator: Create or update fields using expressions, with live preview and the ability to target only highlighted features
+    • Expression-Based Filtering: Use the powerful expression builder to filter and highlight features matching specific criteria
+    • Inline Cell Editing: Double-click cells to edit attribute values directly (when layer is in edit mode)
+    • Dock/Undock Support: Use as a floating window or dock it like the native QGIS attribute table
+    • Full Edit Mode Integration: Delete, Cut, Copy, Paste operations work on highlighted features
+    • Zoom to Features: Quickly zoom to your highlighted subset on the map
+    • Re-select to Highlighted: Narrow your layer selection to just the highlighted subset
+    
+    HOW TO USE:
+    1. Select features in your vector layer using any QGIS selection tool
+    2. Open Advanced Selection Table from Vector → MAS Vector Processing menu
+    3. Your selected features appear with cyan background (original selection)
+    4. Click rows to highlight them (yellow) - these become your "target" features
+    5. Use Ctrl+Click to toggle individual highlights, Shift+Click for range selection
+    6. All operations (Delete, Field Calculator, Zoom, etc.) work on highlighted features first
+    7. Use "Re-select to Highlighted" to narrow your layer selection to just the highlighted subset
+    8. Toggle editing mode to enable inline cell editing and destructive operations
+
+category=Vector
+icon=icons/icon.png
+experimental=False
+deprecated=False
+tags=selection, attribute table, professional, highlight, filter, field calculator, expression, edit, vector, features, subset, multi-select, workflow, advanced
+
+tracker=https://github.com/Mirjan-Ali-Sha/advanced-selection-table/issues
+repository=https://github.com/Mirjan-Ali-Sha/advanced-selection-table
+homepage=https://github.com/Mirjan-Ali-Sha/advanced-selection-table
+
+changelog=
+    2.1.0 - 2026-01-10
+        • Added to MAS Vector Processing menu and toolbar
+        • New custom icons for all toolbar actions
+        • Expandable function tree in Field Calculator with Conditionals
+        • Target checkbox: Toggle between highlighted-only or all selected features
+        • Fixed table cell editing (double-click to edit when in edit mode)
+        • Fixed signal interference during invert_highlights and select_by_expression
+        • Improved editing mode handling with state preservation
+        • Removed trademark references for legal compliance
+    
+    2.0.0 - Complete Rewrite
+        • Two-tier selection system (Cyan = Selected, Yellow = Highlighted)
+        • Professional additive click behavior for highlighting
+        • Expression-based filtering with advanced condition builder
+        • Inline cell editing with layer edit mode integration
+        • Dock/Undock support like native QGIS attribute table
+        • Edit-aware toolbar (Delete, Cut, Paste require edit mode)
+        • Field Calculator targeting highlighted features
+        • Range selection with Shift+Click
+        • Map rubber band highlighting for visual feedback
+    
+    1.0.0 - Initial Release
+        • Basic attribute table for selected features
