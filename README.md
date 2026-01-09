@@ -4,7 +4,8 @@
 
 Advanced Selection Table enhances your QGIS workflow by providing a powerful two-tier selection system. It allows you to maintain your original layer selection (Cyan) while creating a temporary subset (Yellow) for targeted operations, editing, and analysis.
 
-![Screenshot](icons/icon.png)
+<img src="raw.githubusercontent.com/Mirjan-Ali-Sha/advanced_selection_table/blob/main/icons/icon.png" width="15" alt="Screenshot">
+<!-- ![Screenshot](https://github.com/Mirjan-Ali-Sha/advanced_selection_table/blob/main/icons/icon.png){:width="15px"} -->
 
 ## Key Features
 
