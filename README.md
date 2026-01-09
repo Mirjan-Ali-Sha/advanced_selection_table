@@ -4,7 +4,8 @@
 
 Advanced Selection Table enhances your QGIS workflow by providing a powerful two-tier selection system. It allows you to maintain your original layer selection (Cyan) while creating a temporary subset (Yellow) for targeted operations, editing, and analysis.
 
-![Screenshot](icons/icon.png)
+<img src="https://github.com/Mirjan-Ali-Sha/advanced_selection_table/blob/main/icons/icon.png" width="150" alt="Screenshot">
+<!-- ![Screenshot](https://github.com/Mirjan-Ali-Sha/advanced_selection_table/blob/main/icons/icon.png){:width="15px"} -->
 
 ## Key Features
 
@@ -77,7 +78,7 @@ This plugin is released under the GNU General Public License v2.0 (GPLv2).
 
 **Author**: Mirjan Ali Sha  
 **Email**: mastools.help@gmail.com  
-**Bug Tracker**: [GitHub Issues](https://github.com/mastools/advanced-selection-table/issues)
+**Bug Tracker**: [GitHub Issues](https://github.com/Mirjan-Ali-Sha/advanced-selection-table/issues)
 
 ---
 *Developed for professional GIS workflows.*
