@@ -70,6 +70,9 @@ class AdvancedSelectionTable:
         # Close all dialogs
         for dialog in list(self.selection_dialogs.values()):
             if dialog:
+                # Force cleanup of rubber bands explicitly
+                if hasattr(dialog, 'selection_widget'):
+                    dialog.selection_widget.cleanup_rubber_bands()
                 dialog.close()
         
         # Close all docks
@@ -172,6 +175,9 @@ class AdvancedSelectionTable:
         if layer_id in self.selection_docks:
             dock = self.selection_docks.pop(layer_id, None)
             if dock:
+                # CRITICAL: Cleanup rubber bands before removing dock
+                if hasattr(dock, 'selection_widget'):
+                    dock.selection_widget.cleanup_rubber_bands()
                 self.iface.removeDockWidget(dock)
                 dock.deleteLater()
         

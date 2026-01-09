@@ -88,6 +88,33 @@ class AdvancedSelectionWidget(QWidget):
         self.yellow_rubber_band.setFillColor(QColor(255, 255, 0, 150))
         self.yellow_rubber_band.setWidth(3)
 
+    def cleanup_rubber_bands(self):
+        """Remove rubber bands from map canvas - MUST be called on close"""
+        try:
+            canvas = self.iface.mapCanvas()
+            
+            if hasattr(self, 'cyan_rubber_band') and self.cyan_rubber_band:
+                self.cyan_rubber_band.reset()
+                try:
+                    canvas.scene().removeItem(self.cyan_rubber_band)
+                except:
+                    pass
+                self.cyan_rubber_band = None
+            
+            if hasattr(self, 'yellow_rubber_band') and self.yellow_rubber_band:
+                self.yellow_rubber_band.reset()
+                try:
+                    canvas.scene().removeItem(self.yellow_rubber_band)
+                except:
+                    pass
+                self.yellow_rubber_band = None
+            
+            # Force canvas refresh to ensure visual update
+            canvas.refresh()
+        except Exception as e:
+            # Log but don't crash
+            pass
+
     def setup_ui(self):
         """Build the widget UI"""
         layout = QVBoxLayout()
@@ -1114,11 +1141,25 @@ class AdvancedSelectionDialog(QDialog):
     
     def closeEvent(self, event):
         """Restore original selection on close and cleanup rubber bands"""
-        # Clean up rubber bands from map canvas
-        self.selection_widget.cleanup_rubber_bands()
-        
-        if self.selection_widget.original_selection:
-            self.selection_widget._updating_selection = True
-            self.layer.selectByIds(list(self.selection_widget.original_selection))
-            self.selection_widget._updating_selection = False
+        self._do_cleanup()
         event.accept()
+    
+    def reject(self):
+        """Handle dialog rejection (X button, Escape key)"""
+        self._do_cleanup()
+        super().reject()
+    
+    def _do_cleanup(self):
+        """Internal cleanup method - called from both closeEvent and reject"""
+        try:
+            # Clean up rubber bands from map canvas
+            if hasattr(self, 'selection_widget') and self.selection_widget:
+                self.selection_widget.cleanup_rubber_bands()
+                
+                # Restore original selection
+                if self.selection_widget.original_selection:
+                    self.selection_widget._updating_selection = True
+                    self.layer.selectByIds(list(self.selection_widget.original_selection))
+                    self.selection_widget._updating_selection = False
+        except Exception:
+            pass  # Fail silently during cleanup

@@ -2,7 +2,7 @@
 name=Advanced Selection Table
 qgisMinimumVersion=3.0
 description=Professional attribute table with two-tier selection (Cyan = Selected, Yellow = Highlighted) for advanced feature filtering and editing
-version=2.1.0
+version=2.1.1
 author=Mirjan Ali Sha
 email=mastools.help@gmail.com
 
@@ -34,11 +34,18 @@ experimental=False
 deprecated=False
 tags=selection, attribute table, professional, highlight, filter, field calculator, expression, edit, vector, features, subset, multi-select, workflow, advanced
 
-tracker=https://github.com/Mirjan-Ali-Sha/advanced-selection-table/issues
-repository=https://github.com/Mirjan-Ali-Sha/advanced-selection-table
-homepage=https://github.com/Mirjan-Ali-Sha/advanced-selection-table
+tracker=https://github.com/Mirjan-Ali-Sha/advanced_selection_table/wiki 
+repository=https://github.com/Mirjan-Ali-Sha/advanced_selection_table
+homepage=https://github.com/Mirjan-Ali-Sha/advanced_selection_table
 
 changelog=
+    2.1.1 - 2026-01-10
+        • Fixed rubber band cleanup when closing floating window
+        • Fixed rubber band cleanup when converting dock to dialog
+        • Fixed rubber band cleanup on plugin reload
+        • Added canvas refresh after rubber band removal
+        • Improved error handling in cleanup routines
+    
     2.1.0 - 2026-01-10
         • Added to MAS Vector Processing menu and toolbar
         • New custom icons for all toolbar actions
